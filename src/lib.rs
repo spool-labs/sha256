@@ -1,4 +1,4 @@
-//! Multi-buffer SHA-256: hash many independent messages at once
+//! SHA-256 in bulk: many independent messages at once, or iterated chains
 //!
 //! One hash cannot be vectorised, since each of the 64 rounds depends on the
 //! last. Independent messages can, though: run them in lockstep, one per SIMD
@@ -83,6 +83,20 @@
 //! no spare thread to claim and the gain goes away. Use an equal split of the
 //! same kernel: an uneven or mixed-kernel split leaves a straggler and measured
 //! worse than a single thread.
+//!
+//! # Hash chains
+//!
+//! Everything above is one pass over messages that already exist. A chain
+//! instead feeds each digest back in as the next message, which is what
+//! Solana's proof of history is.
+//!
+//! [`hash_chain`] is the exception to the whole premise of this crate: one
+//! chain has no independent work to lane up, so it ignores the multi-buffer
+//! kernels and drives the CPU's SHA-256 unit at its latency floor.
+//!
+//! [`hash_chains`] puts the premise back. Independent chains, one per
+//! verified entry, say run in lockstep exactly like independent messages
+//! do, which trades that latency floor for a throughput one. See both.
 
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
 mod avx2;
@@ -91,6 +105,7 @@ mod avx512;
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
 mod avx512x2;
 mod batch;
+mod chain;
 mod core;
 mod lanes;
 #[cfg(all(target_arch = "aarch64", not(feature = "scalar")))]
@@ -169,6 +184,69 @@ pub fn hash_messages(msgs: &[Message<'_>], out: &mut [[u8; 32]]) {
     dispatch::hash(msgs, out);
 }
 
+/// Hashes `seed`, then that digest, and so on `n` times
+///
+/// The message is always 32 bytes, which makes the padded block constant above
+/// word 8 and lets the state feed back without the byte swap a general
+/// `sha256(digest)` would pay twice per link.
+///
+/// Returns `seed` unchanged when `n` is 0.
+///
+/// ```
+/// use tape_sha256::hash_chain;
+///
+/// let seed = [0u8; 32];
+/// assert_eq!(hash_chain(&seed, 3), hash_chain(&hash_chain(&seed, 1), 2));
+/// ```
+pub fn hash_chain(seed: &[u8; 32], n: u64) -> [u8; 32] {
+    chain::hash_chain(seed, n)
+}
+
+/// Hashes many independent chains at once, one per lane
+///
+/// `out[i]` is `seeds[i]` hashed back into itself `lens[i]` times, the same
+/// answer `hash_chain` gives, but the chains run in lockstep so the SHA-256
+/// unit is throughput-bound instead of latency-bound.
+///
+/// A single chain cannot go faster than one block compression's latency, and
+/// `hash_chain` already sits there. Independent chains are a different
+/// problem, and Solana replay has them: every `Entry` publishes its ending
+/// hash, so entry `i`'s segment starts from entry `i - 1`'s known hash and all
+/// segments can be verified at once. Ragged lengths are scheduled, not paid
+/// for: chains run longest-first and a lane that finishes picks up the next
+/// chain, so a batch costs about `lens.iter().sum() / width` links, however
+/// the lengths fall.
+///
+/// Uses `backend`'s kernel, not `chain_backend`'s.
+///
+/// # Panics
+///
+/// Panics unless `seeds.len() == lens.len() == out.len()`.
+///
+/// ```
+/// use tape_sha256::{hash_chain, hash_chains};
+///
+/// let seeds = [[1u8; 32], [2u8; 32]];
+/// let lens = [7u64, 9];
+/// let mut out = [[0u8; 32]; 2];
+/// hash_chains(&seeds, &lens, &mut out);
+/// assert_eq!(out[0], hash_chain(&seeds[0], 7));
+/// assert_eq!(out[1], hash_chain(&seeds[1], 9));
+/// ```
+pub fn hash_chains(seeds: &[[u8; 32]], lens: &[u64], out: &mut [[u8; 32]]) {
+    assert_eq!(seeds.len(), lens.len());
+    assert_eq!(seeds.len(), out.len());
+    chain::hash_chains(seeds, lens, out);
+}
+
+/// Name of the kernel `hash_chain` uses
+///
+/// Not the same choice as `backend`: the chain cares only whether a SHA-256
+/// unit exists, never how wide the vector unit is.
+pub fn chain_backend() -> &'static str {
+    chain::backend()
+}
+
 /// Backends exposed for differential testing and benchmarking
 ///
 /// Not stable API; callers should use hash_many and let dispatch pick. Each
@@ -183,10 +261,10 @@ pub mod backends {
     // Concrete scalar group functions; see GroupFn for why kernels are
     // instantiated once here and called through pointers.
     pub(crate) fn scalar1(msgs: &[Message<'_>], out: &mut [[u8; 32]]) {
-        batch::hash_lanes::<Scalar<1>>(msgs, out)
+        batch::hash_lanes::<Scalar<1>, 1>(msgs, out)
     }
     pub(crate) fn scalar8(msgs: &[Message<'_>], out: &mut [[u8; 32]]) {
-        batch::hash_lanes::<Scalar<8>>(msgs, out)
+        batch::hash_lanes::<Scalar<8>, 8>(msgs, out)
     }
     /// Portable 8-lane kernel
     ///
@@ -381,6 +459,106 @@ pub mod backends {
             bodies,
             out,
         )
+    }
+
+    /// Fallback where no SHA-256 unit exists
+    pub fn chain_portable(seed: &[u8; 32], n: u64) -> [u8; 32] {
+        crate::chain::portable(seed, n)
+    }
+
+    /// Chain on the x86 SHA-NI extension
+    ///
+    /// # Safety
+    ///
+    /// The running CPU must support SHA-NI, SSSE3, and SSE4.1.
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+    pub unsafe fn chain_shani(seed: &[u8; 32], n: u64) -> [u8; 32] {
+        crate::shani::chain(seed, n)
+    }
+
+    /// Chain on the ARMv8 SHA-256 crypto extension
+    ///
+    /// # Safety
+    ///
+    /// The running CPU must support the `sha2` extension.
+    #[cfg(all(target_arch = "aarch64", not(feature = "scalar")))]
+    pub unsafe fn chain_neon_sha2(seed: &[u8; 32], n: u64) -> [u8; 32] {
+        crate::neon_sha2::chain(seed, n)
+    }
+
+    /// Lockstep chain kernels, one entry per dispatchable backend
+    ///
+    /// Each pins one step kernel under the shared scheduler, so any number of
+    /// chains streams through that kernel's width. `hash_chains` picks between
+    /// them and the serial chain; these exist so the choice can be measured
+    /// rather than asserted.
+    pub mod chains {
+        use crate::chain::run_scheduled;
+
+        pub fn portable1(seeds: &[[u8; 32]], lens: &[u64], out: &mut [[u8; 32]]) {
+            // SAFETY: the scalar steps need no CPU feature.
+            unsafe { run_scheduled(1, crate::chain::steps_scalar1, seeds, lens, out) }
+        }
+        pub fn portable8(seeds: &[[u8; 32]], lens: &[u64], out: &mut [[u8; 32]]) {
+            // SAFETY: as above.
+            unsafe { run_scheduled(8, crate::chain::steps_scalar8, seeds, lens, out) }
+        }
+
+        /// # Safety
+        ///
+        /// The running CPU must support the `sha2` extension.
+        #[cfg(all(target_arch = "aarch64", not(feature = "scalar")))]
+        pub unsafe fn neon_sha2x4(seeds: &[[u8; 32]], lens: &[u64], out: &mut [[u8; 32]]) {
+            run_scheduled(4, crate::neon_sha2::steps4, seeds, lens, out)
+        }
+
+        /// # Safety
+        ///
+        /// The running CPU must support the `sha2` extension.
+        #[cfg(all(target_arch = "aarch64", not(feature = "scalar")))]
+        pub unsafe fn neon_sha2x8(seeds: &[[u8; 32]], lens: &[u64], out: &mut [[u8; 32]]) {
+            run_scheduled(8, crate::neon_sha2::steps8, seeds, lens, out)
+        }
+
+        /// # Safety
+        ///
+        /// NEON is baseline on AArch64.
+        #[cfg(all(target_arch = "aarch64", not(feature = "scalar")))]
+        pub unsafe fn neon4(seeds: &[[u8; 32]], lens: &[u64], out: &mut [[u8; 32]]) {
+            run_scheduled(4, crate::neon::steps, seeds, lens, out)
+        }
+
+        /// # Safety
+        ///
+        /// The running CPU must support SHA-NI, SSSE3, and SSE4.1.
+        #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+        pub unsafe fn shani_x4(seeds: &[[u8; 32]], lens: &[u64], out: &mut [[u8; 32]]) {
+            run_scheduled(4, crate::shani::steps4, seeds, lens, out)
+        }
+
+        /// # Safety
+        ///
+        /// The running CPU must support AVX2.
+        #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+        pub unsafe fn avx2_8(seeds: &[[u8; 32]], lens: &[u64], out: &mut [[u8; 32]]) {
+            run_scheduled(8, crate::avx2::steps, seeds, lens, out)
+        }
+
+        /// # Safety
+        ///
+        /// The running CPU must support AVX-512F and AVX-512BW.
+        #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+        pub unsafe fn avx512_16(seeds: &[[u8; 32]], lens: &[u64], out: &mut [[u8; 32]]) {
+            run_scheduled(16, crate::avx512::steps, seeds, lens, out)
+        }
+
+        /// # Safety
+        ///
+        /// The running CPU must support AVX-512F and AVX-512BW.
+        #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+        pub unsafe fn avx512_16x2(seeds: &[[u8; 32]], lens: &[u64], out: &mut [[u8; 32]]) {
+            run_scheduled(32, crate::avx512x2::steps2, seeds, lens, out)
+        }
     }
 }
 
@@ -652,7 +830,7 @@ mod dispatch {
 
     #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
     #[inline]
-    fn have_shani() -> bool {
+    pub(crate) fn have_shani() -> bool {
         is_x86_feature_detected!("sha")
             && is_x86_feature_detected!("ssse3")
             && is_x86_feature_detected!("sse4.1")

@@ -1,6 +1,6 @@
-//! Merkle interior nodes: agave's serial `join_nodes` vs batching them
+//! Merkle interior nodes: the validator's serial join vs batching them
 //!
-//! agave hashes shred-tree leaves in a batch (that is what this crate is
+//! Validators hash shred-tree leaves in a batch (that is what this crate is
 //! integrated for) but joins interior nodes one at a time:
 //!
 //!   join_nodes(a, b) = hashv(&[MERKLE_HASH_PREFIX_NODE, a[..20], b[..20]])
@@ -61,7 +61,7 @@ fn bench<F: FnMut()>(name: &str, hashes: usize, mut f: F) -> f64 {
     best
 }
 
-/// agave's join_nodes, against the independent sha2 crate.
+/// the validator's serial node join, against the independent sha2 crate.
 fn join_serial(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let mut d = Sha256::new();
     d.update(PREFIX_NODE);
@@ -98,7 +98,7 @@ fn main() {
     println!();
 
     let mut sout = vec![[0u8; 32]; total];
-    let serial = bench("agave join_nodes (serial)", total, || {
+    let serial = bench("validator join (serial)", total, || {
         for (o, p) in sout.iter_mut().zip(nodes.chunks_exact(2)) {
             *o = join_serial(&p[0], &p[1]);
         }
@@ -138,7 +138,7 @@ fn main() {
         std::hint::black_box(&out);
     });
 
-    // Correctness: the batched path must equal agave's join_nodes.
+    // Correctness: the batched path must equal the serial join.
     {
         let pairs: Vec<_> = nodes.chunks_exact(2).take(total).collect();
         let bodies: Vec<[u8; 2 * PROOF_ENTRY]> = pairs
@@ -156,7 +156,7 @@ fn main() {
         for (i, p) in pairs.iter().enumerate() {
             assert_eq!(got[i], join_serial(&p[0], &p[1]), "node {i}");
         }
-        println!("\n(verified: batched output == agave join_nodes for all {total})");
+        println!("\n(verified: batched output == serial join for all {total})");
     }
 
     // Same work, but batched per FEC set (63 at a time) rather than per block

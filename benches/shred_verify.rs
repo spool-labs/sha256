@@ -1,6 +1,6 @@
 //! Shred verification: Merkle proof work vs the signature check beside it
 //!
-//! agave's `verify_shred_cpu` (ledger/src/sigverify_shreds.rs) does three
+//! the Solana validator's shred verification does three
 //! things per received shred: rebuild the Merkle root from the shred's leaf
 //! and proof, look up `(signature, pubkey, root)` in an LRU cache, and verify
 //! the signature only on a miss.
@@ -83,8 +83,8 @@ fn main() {
     println!("active backend: {}", tape_sha256::backend());
     println!();
 
-    // What agave does now: per shred, walk the proof serially.
-    let serial = bench("merkle rebuild, serial (agave)", || {
+    // What validators do now: per shred, walk the proof serially.
+    let serial = bench("merkle rebuild, serial (validator)", || {
         let mut roots = [[0u8; 32]; SHREDS];
         for (i, leaf) in leaves.iter().enumerate() {
             let mut node = *leaf;

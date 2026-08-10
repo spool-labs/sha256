@@ -54,7 +54,15 @@ unsafe fn load_be(p: *const u8, off: usize) -> uint32x4_t {
 /// No feature gate: NEON is baseline on AArch64. Entry points reach it through
 /// `GroupFn` so the kernel is compiled exactly once.
 pub(crate) fn group(msgs: &[crate::batch::Message<'_>], out: &mut [[u8; 32]]) {
-    crate::batch::hash_lanes::<Neon>(msgs, out)
+    crate::batch::hash_lanes::<Neon, { <Neon as Lanes>::N }>(msgs, out)
+}
+
+/// # Safety
+///
+/// NEON is baseline on AArch64, so this is always safe to call there.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn steps(h: &mut [[u32; 8]], n: u64) {
+    crate::chain::steps_lanes::<Neon, { <Neon as Lanes>::N }>(h, n)
 }
 
 impl Lanes for Neon {

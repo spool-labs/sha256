@@ -22,10 +22,9 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// The inverse of `words`: eight in-order state words into ABEF/CDGH
     #[inline(always)]
-    pub(crate) unsafe fn init() -> Self {
-        let abcd = _mm_loadu_si128(H0.as_ptr() as *const __m128i);
-        let efgh = _mm_loadu_si128(H0.as_ptr().add(4) as *const __m128i);
+    pub(crate) unsafe fn pack(abcd: __m128i, efgh: __m128i) -> Self {
         let t = _mm_shuffle_epi32(abcd, 0xB1);
         let e = _mm_shuffle_epi32(efgh, 0x1B);
         State {
@@ -34,13 +33,30 @@ impl State {
         }
     }
 
-    /// Undoes the ABEF/CDGH interleave and emits the digest big-endian
     #[inline(always)]
-    pub(crate) unsafe fn digest(self) -> [u8; 32] {
+    pub(crate) unsafe fn init() -> Self {
+        Self::pack(
+            _mm_loadu_si128(H0.as_ptr() as *const __m128i),
+            _mm_loadu_si128(H0.as_ptr().add(4) as *const __m128i),
+        )
+    }
+
+    /// Undoes the ABEF/CDGH interleave, giving the eight state words in order
+    ///
+    /// Split from `digest` because the chain needs the words themselves: they
+    /// are already the next block's, and byte-swapping out and back would
+    /// cancel.
+    #[inline(always)]
+    pub(crate) unsafe fn words(self) -> (__m128i, __m128i) {
         let t = _mm_shuffle_epi32(self.abef, 0x1B);
         let s1 = _mm_shuffle_epi32(self.cdgh, 0xB1);
-        let abcd = _mm_blend_epi16(t, s1, 0xF0);
-        let efgh = _mm_alignr_epi8(s1, t, 8);
+        (_mm_blend_epi16(t, s1, 0xF0), _mm_alignr_epi8(s1, t, 8))
+    }
+
+    /// Emits the digest big-endian
+    #[inline(always)]
+    pub(crate) unsafe fn digest(self) -> [u8; 32] {
+        let (abcd, efgh) = self.words();
         let mask = _mm_loadu_si128(BSWAP.as_ptr() as *const __m128i);
         let mut out = [0u8; 32];
         _mm_storeu_si128(
@@ -92,13 +108,16 @@ unsafe fn round4(st: &mut State, m: &mut [__m128i; 4], i: usize) {
     }
 }
 
-/// Compresses one block for a single stream, used for ragged tails
+/// Compresses one block for a single stream
 #[inline(always)]
 unsafe fn compress_block(st: &mut State, m: &mut [__m128i; 4]) {
     let save = *st;
-    for i in 0..16 {
-        round4(st, m, i);
+    // Literal group indices for the reason spelled out on `compress_interleaved`:
+    // rolled, the msg1/msg2 range tests survive as per-iteration branches.
+    macro_rules! groups {
+        ($($i:literal)*) => { $( round4(st, m, $i); )* };
     }
+    groups!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
     st.abef = _mm_add_epi32(st.abef, save.abef);
     st.cdgh = _mm_add_epi32(st.cdgh, save.cdgh);
 }
@@ -222,6 +241,92 @@ pub(crate) unsafe fn group(msgs: &[Message<'_>], out: &mut [[u8; 32]]) {
         for (m, oi) in msgs.iter().zip(out.iter_mut()) {
             hash_one(m, oi);
         }
+    }
+}
+
+/// one compression per link, and nothing else
+///
+/// The state words are the next block's first eight words already, so the pair
+/// of byte swaps that `digest` and `load_msg` would do is dropped entirely and
+/// only the ABEF/CDGH unpack survives. Words 8..16 are loop-invariant.
+///
+/// # Safety
+///
+/// The running CPU must support SHA-NI, SSSE3, and SSE4.1.
+#[target_feature(enable = "sha,ssse3,sse4.1")]
+pub(crate) unsafe fn chain(seed: &[u8; 32], n: u64) -> [u8; 32] {
+    let mask = _mm_loadu_si128(BSWAP.as_ptr() as *const __m128i);
+    let mut abcd = _mm_shuffle_epi8(_mm_loadu_si128(seed.as_ptr() as *const __m128i), mask);
+    let mut efgh = _mm_shuffle_epi8(
+        _mm_loadu_si128(seed.as_ptr().add(16) as *const __m128i),
+        mask,
+    );
+    let pad0 = _mm_loadu_si128(crate::chain::PAD.as_ptr() as *const __m128i);
+    let pad1 = _mm_loadu_si128(crate::chain::PAD.as_ptr().add(4) as *const __m128i);
+
+    let init = State::init();
+    for _ in 0..n {
+        let mut st = init;
+        let mut m = [abcd, efgh, pad0, pad1];
+        compress_block(&mut st, &mut m);
+        (abcd, efgh) = st.words();
+    }
+
+    let mut out = [0u8; 32];
+    _mm_storeu_si128(
+        out.as_mut_ptr() as *mut __m128i,
+        _mm_shuffle_epi8(abcd, mask),
+    );
+    _mm_storeu_si128(
+        out.as_mut_ptr().add(16) as *mut __m128i,
+        _mm_shuffle_epi8(efgh, mask),
+    );
+    out
+}
+
+/// Advances `STREAMS` interlaced chains `n` links: this unit's step kernel
+///
+/// The serial chain leaves the SHA unit's issue slots mostly idle behind one
+/// dependency chain; independent chains fill them, which is what replay has
+/// and generation does not. The scheduler owns raggedness, so this loop is
+/// compressions and nothing else, with the byte swaps paid there once per
+/// chain; only the ABEF/CDGH pack and unpack remain per link.
+///
+/// # Safety
+///
+/// The running CPU must support SHA-NI, SSSE3, and SSE4.1.
+#[target_feature(enable = "sha,ssse3,sse4.1")]
+pub(crate) unsafe fn steps4(h: &mut [[u32; 8]], n: u64) {
+    debug_assert_eq!(h.len(), STREAMS);
+
+    let pad0 = _mm_loadu_si128(crate::chain::PAD.as_ptr() as *const __m128i);
+    let pad1 = _mm_loadu_si128(crate::chain::PAD.as_ptr().add(4) as *const __m128i);
+
+    let mut abcd = [_mm_setzero_si128(); STREAMS];
+    let mut efgh = [_mm_setzero_si128(); STREAMS];
+    for lane in 0..STREAMS {
+        abcd[lane] = _mm_loadu_si128(h[lane].as_ptr() as *const __m128i);
+        efgh[lane] = _mm_loadu_si128(h[lane].as_ptr().add(4) as *const __m128i);
+    }
+
+    let init = [State::init(); STREAMS];
+    for _ in 0..n {
+        let mut st = init;
+        let mut msg = [[_mm_setzero_si128(); 4]; STREAMS];
+        for (m, (a, e)) in msg.iter_mut().zip(abcd.iter().zip(efgh.iter())) {
+            *m = [*a, *e, pad0, pad1];
+        }
+        compress_interleaved(&mut st, &mut msg);
+        for (lane, s) in st.iter().enumerate() {
+            let (a, e) = s.words();
+            abcd[lane] = a;
+            efgh[lane] = e;
+        }
+    }
+
+    for lane in 0..STREAMS {
+        _mm_storeu_si128(h[lane].as_mut_ptr() as *mut __m128i, abcd[lane]);
+        _mm_storeu_si128(h[lane].as_mut_ptr().add(4) as *mut __m128i, efgh[lane]);
     }
 }
 

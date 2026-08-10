@@ -1,6 +1,6 @@
 //! Hashes one Solana erasure batch of Merkle leaves, backends against `sha2`
 //!
-//! `sha2` is the baseline because it is what agave's shredder and recovery
+//! `sha2` is the baseline because it is what the validator's shredder and recovery
 //! path use for leaf hashing today.
 //!
 //! The workload is the real one: 64 leaves (32 data + 32 coding shreds), each
@@ -79,6 +79,51 @@ mod firedancer {
                 hash: [std::ptr::null_mut(); AVX512_LANES],
             }
         }
+    }
+}
+
+/// isa-l_crypto's multi-buffer SHA-256, purely as a benchmark reference
+///
+/// Enabled with `--features isal-bench` and `ISAL_DIR` pointing at a built
+/// isa-l_crypto tree. Nothing from isa-l is vendored or linked into the
+/// library itself.
+///
+/// Everything crosses the boundary through `benches/isal_shim.c` rather than a
+/// repr(C) mirror of `ISAL_SHA256_HASH_CTX`. A wrong mirror would not fail to
+/// link, it would corrupt the manager's state, so the layout stays on the C
+/// side and Rust sees an opaque handle.
+///
+/// Unlike Firedancer's kernels these are a job-manager API: submit N jobs,
+/// flush until drained. That scheduling is real work the kernel-level calls do
+/// not do, so this row is what an isa-l caller pays, not a bare kernel time.
+#[cfg(feature = "isal-bench")]
+mod isal {
+    use std::os::raw::c_void;
+
+    unsafe extern "C" {
+        pub fn isal_bench_new() -> *mut c_void;
+        pub fn isal_bench_free(h: *mut c_void);
+        pub fn isal_bench_run_avx512(
+            h: *mut c_void,
+            n: u32,
+            bufs: *const *const u8,
+            lens: *const u32,
+            out: *mut [u8; 32],
+        ) -> i32;
+        pub fn isal_bench_run_avx512_ni(
+            h: *mut c_void,
+            n: u32,
+            bufs: *const *const u8,
+            lens: *const u32,
+            out: *mut [u8; 32],
+        ) -> i32;
+        pub fn isal_bench_run_dispatch(
+            h: *mut c_void,
+            n: u32,
+            bufs: *const *const u8,
+            lens: *const u32,
+            out: *mut [u8; 32],
+        ) -> i32;
     }
 }
 
@@ -197,7 +242,7 @@ fn main() {
 
     let mut out = vec![[0u8; 32]; LEAVES];
 
-    // The baseline: what agave does today, one `hashv` call per leaf.
+    // The baseline: what validators do today, one hash call per leaf.
     let sha2_time = bench("sha2 (serial, current)", total_bytes, || {
         for (i, leaf) in refs.iter().enumerate() {
             let mut h = Sha256::new();
@@ -345,6 +390,80 @@ fn main() {
     #[cfg(not(feature = "firedancer-bench"))]
     let (fd_avx_time, fd_avx512_time): (Option<f64>, Option<f64>) = (None, None);
 
+    // isa-l_crypto, same treatment as Firedancer: the prefix concat is hoisted
+    // out of the timed region, so this measures its scheduler and kernels
+    // rather than memcpy.
+    #[cfg(feature = "isal-bench")]
+    let (isal_avx512_time, isal_avx512_ni_time, isal_dispatch_time) = {
+        let joined: Vec<Vec<u8>> = refs.iter().map(|leaf| [PREFIX, leaf].concat()).collect();
+        let bufs: Vec<*const u8> = joined.iter().map(|m| m.as_ptr()).collect();
+        let lens: Vec<u32> = joined.iter().map(|m| m.len() as u32).collect();
+
+        let handle = unsafe { isal::isal_bench_new() };
+        assert!(!handle.is_null(), "isal_bench_new failed");
+
+        // A mis-wired FFI produces a fast wrong answer rather than a link
+        // error, so every entry point is gated against sha2 before it is
+        // timed. The digest byte order in particular is easy to get wrong:
+        // isa-l leaves the words native-endian.
+        let expect: Vec<[u8; 32]> = joined
+            .iter()
+            .map(|m| {
+                let mut h = Sha256::new();
+                h.update(m);
+                h.finalize().into()
+            })
+            .collect();
+
+        macro_rules! isal_row {
+            ($name:expr, $f:path) => {{
+                let mut got = vec![[0u8; 32]; LEAVES];
+                let rc = unsafe {
+                    $f(
+                        handle,
+                        LEAVES as u32,
+                        bufs.as_ptr(),
+                        lens.as_ptr(),
+                        got.as_mut_ptr(),
+                    )
+                };
+                if rc != 0 {
+                    println!("{:<28}unavailable (rc {rc})", $name);
+                    None
+                } else if got != expect {
+                    panic!("{} disagrees with sha2 -- FFI is wrong, not slow", $name);
+                } else {
+                    Some(bench($name, total_bytes, || {
+                        let rc = unsafe {
+                            $f(
+                                handle,
+                                LEAVES as u32,
+                                bufs.as_ptr(),
+                                lens.as_ptr(),
+                                out.as_mut_ptr(),
+                            )
+                        };
+                        debug_assert_eq!(rc, 0);
+                        std::hint::black_box(&out);
+                    }))
+                }
+            }};
+        }
+
+        let a = isal_row!("isa-l mb (x16 avx512)", isal::isal_bench_run_avx512);
+        let b = isal_row!("isa-l mb (x16 avx512-ni)", isal::isal_bench_run_avx512_ni);
+        let c = isal_row!("isa-l mb (dispatched)", isal::isal_bench_run_dispatch);
+
+        unsafe { isal::isal_bench_free(handle) };
+        (a, b, c)
+    };
+    #[cfg(not(feature = "isal-bench"))]
+    let (isal_avx512_time, isal_avx512_ni_time, isal_dispatch_time): (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    ) = (None, None, None);
+
     println!();
     println!("speedup vs sha2 serial baseline:");
     println!("  portable-8  {:.2}x", sha2_time / portable);
@@ -359,6 +478,23 @@ fn main() {
             }
             if let Some(t) = avx512 {
                 println!("  fd-avx512   {:.2}x", sha2_time / t);
+            }
+        }
+    }
+    match (isal_avx512_time, isal_avx512_ni_time, isal_dispatch_time) {
+        (None, None, None) => println!(
+            "  isa-l       not linked (build with --features isal-bench \
+             and ISAL_DIR set)"
+        ),
+        (a, b, c) => {
+            if let Some(t) = a {
+                println!("  isal-avx512 {:.2}x", sha2_time / t);
+            }
+            if let Some(t) = b {
+                println!("  isal-av512ni{:.2}x", sha2_time / t);
+            }
+            if let Some(t) = c {
+                println!("  isal-disp   {:.2}x", sha2_time / t);
             }
         }
     }

@@ -34,7 +34,12 @@ const _: () = assert!(WIDTH <= crate::batch::MAX_WIDTH);
 /// literal indices keep both schedule windows in registers. Its four
 /// invocations are not — see the loop at the end of this function.
 #[inline(always)]
-fn compress2<L: Lanes>(sa: &mut [L; 8], sb: &mut [L; 8], mut wa: [L; 16], mut wb: [L; 16]) {
+pub(crate) fn compress2<L: Lanes>(
+    sa: &mut [L; 8],
+    sb: &mut [L; 8],
+    mut wa: [L; 16],
+    mut wb: [L; 16],
+) {
     let [mut a0, mut b0, mut c0, mut d0, mut e0, mut f0, mut g0, mut h0] = *sa;
     let [mut a1, mut b1, mut c1, mut d1, mut e1, mut f1, mut g1, mut h1] = *sb;
 
@@ -216,4 +221,14 @@ pub(crate) unsafe fn group2(msgs: &[Message<'_>], out: &mut [[u8; 32]]) {
         // the cross-wave overlap is lost.
         crate::batch::drive(WAVE, crate::avx512::group, msgs, out);
     }
+}
+
+/// Advances 32 chains as two interlaced 16-lane waves
+///
+/// # Safety
+///
+/// The running CPU must support AVX-512F and AVX-512BW.
+#[target_feature(enable = "avx512f,avx512bw")]
+pub(crate) unsafe fn steps2(h: &mut [[u32; 8]], n: u64) {
+    crate::chain::steps_lanes2::<Avx512, WAVE>(h, n)
 }

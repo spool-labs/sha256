@@ -43,7 +43,15 @@ unsafe fn load_be(p: *const u8, off: usize) -> v128 {
 /// Entry points reach it through `GroupFn` so the kernel is compiled exactly
 /// once.
 pub(crate) fn group(msgs: &[crate::batch::Message<'_>], out: &mut [[u8; 32]]) {
-    crate::batch::hash_lanes::<Simd128>(msgs, out)
+    crate::batch::hash_lanes::<Simd128, { <Simd128 as Lanes>::N }>(msgs, out)
+}
+
+/// # Safety
+///
+/// An engine without simd128 rejects the module at instantiation, so a call
+/// that runs at all is safe.
+pub(crate) unsafe fn steps(h: &mut [[u32; 8]], n: u64) {
+    crate::chain::steps_lanes::<Simd128, { <Simd128 as Lanes>::N }>(h, n)
 }
 
 impl Lanes for Simd128 {
@@ -147,11 +155,11 @@ pub struct Waves<const W: usize>([Simd128; W]);
 // One concrete instantiation per wave count, reached through GroupFn like
 // every other kernel so each is compiled exactly once.
 pub(crate) fn group8(msgs: &[crate::batch::Message<'_>], out: &mut [[u8; 32]]) {
-    crate::batch::hash_lanes::<Waves<2>>(msgs, out)
+    crate::batch::hash_lanes::<Waves<2>, { <Waves<2> as Lanes>::N }>(msgs, out)
 }
 
 pub(crate) fn group16(msgs: &[crate::batch::Message<'_>], out: &mut [[u8; 32]]) {
-    crate::batch::hash_lanes::<Waves<4>>(msgs, out)
+    crate::batch::hash_lanes::<Waves<4>, { <Waves<4> as Lanes>::N }>(msgs, out)
 }
 
 impl<const W: usize> Lanes for Waves<W> {

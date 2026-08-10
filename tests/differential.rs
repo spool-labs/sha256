@@ -377,10 +377,10 @@ fn report_exercised_backends() {
 
 /// `hash_pairs` must equal hashing the materialised `prefix || left || right`
 ///
-/// This is the Merkle interior-node shape: agave's `join_nodes` hashes a
-/// 26-byte domain prefix and two 20-byte proof entries from separate buffers
-/// (ledger/src/shred/merkle_tree.rs). The three-segment path must not drift
-/// from simple concatenation, at any length or batch size.
+/// This is the Merkle interior-node shape: a node hashes a 26-byte domain
+/// prefix and two 20-byte proof entries held in separate buffers. The
+/// three-segment path must not drift from simple concatenation, at any
+/// length or batch size.
 #[test]
 fn hash_pairs_matches_concatenation() {
     use tape_sha256::hash_pairs;
@@ -415,6 +415,199 @@ fn hash_pairs_matches_concatenation() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// `hash_chain` must equal `sha2` fed back into itself.
+#[test]
+fn hash_chain_matches_sha2() {
+    use tape_sha256::hash_chain;
+
+    for seed_byte in [0u8, 1, 0xff, 0x5a] {
+        let seed = [seed_byte; 32];
+        let mut want = seed;
+        for n in 0..=64u64 {
+            assert_eq!(hash_chain(&seed, n), want, "seed {seed_byte:#x} n {n}");
+            assert_eq!(
+                tape_sha256::backends::chain_portable(&seed, n),
+                want,
+                "portable, seed {seed_byte:#x} n {n}"
+            );
+            want = reference(&want);
+        }
+    }
+}
+
+/// A chain of `a + b` links must be a chain of `a` continued by one of `b`
+///
+/// Entry verification restarts the chain at every entry boundary, so a kernel
+/// whose first link differs from its steady-state one would still pass a
+/// fixed-length check.
+#[test]
+fn hash_chain_composes() {
+    use tape_sha256::hash_chain;
+
+    let seed = [7u8; 32];
+    for a in [0u64, 1, 2, 3, 63, 64, 65, 500] {
+        for b in [0u64, 1, 2, 3, 500] {
+            assert_eq!(
+                hash_chain(&seed, a + b),
+                hash_chain(&hash_chain(&seed, a), b),
+                "a {a} b {b}"
+            );
+        }
+    }
+}
+
+/// A long chain, so a kernel that drifts only after many links is caught
+#[test]
+fn hash_chain_long_run() {
+    use tape_sha256::hash_chain;
+
+    const LINKS: u64 = 62_500;
+    let seed = [0x33u8; 32];
+
+    let mut want = seed;
+    for _ in 0..LINKS {
+        want = reference(&want);
+    }
+    assert_eq!(hash_chain(&seed, LINKS), want);
+    assert_eq!(tape_sha256::backends::chain_portable(&seed, LINKS), want);
+}
+
+/// `hash_chains` must agree with `hash_chain` lane for lane
+///
+/// The scheduler retires a lane at its finish line and refills it from the
+/// queue, so ragged and short batches are where a chain could pick up another
+/// chain's state. Swept over batch sizes around every kernel width, and over
+/// lengths that finish in every order, including zero.
+#[test]
+fn hash_chains_matches_hash_chain() {
+    use tape_sha256::{hash_chain, hash_chains};
+
+    let seeds: Vec<[u8; 32]> = (0..70u8).map(|i| [i.wrapping_mul(37); 32]).collect();
+
+    for count in [
+        1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 70,
+    ] {
+        for shape in 0..4 {
+            let lens: Vec<u64> = (0..count)
+                .map(|i| match shape {
+                    // uniform, the tick-entry case
+                    0 => 37,
+                    // ascending, descending, and a spread including zero
+                    1 => i as u64,
+                    2 => (count - i) as u64,
+                    _ => ((i * 7) % 11) as u64,
+                })
+                .collect();
+
+            let mut got = vec![[0u8; 32]; count];
+            hash_chains(&seeds[..count], &lens, &mut got);
+
+            for i in 0..count {
+                assert_eq!(
+                    got[i],
+                    hash_chain(&seeds[i], lens[i]),
+                    "count {count} shape {shape} lane {i} len {}",
+                    lens[i]
+                );
+            }
+        }
+    }
+}
+
+/// The replay shape: many equal-length chains, checked against sha2 directly
+#[test]
+fn hash_chains_replay_shape() {
+    use tape_sha256::hash_chains;
+
+    const ENTRIES: usize = 64;
+    const LINKS: u64 = 500;
+
+    let seeds: Vec<[u8; 32]> = (0..ENTRIES).map(|i| [i as u8; 32]).collect();
+    let lens = vec![LINKS; ENTRIES];
+    let mut got = vec![[0u8; 32]; ENTRIES];
+    hash_chains(&seeds, &lens, &mut got);
+
+    for (i, seed) in seeds.iter().enumerate() {
+        let mut want = *seed;
+        for _ in 0..LINKS {
+            want = reference(&want);
+        }
+        assert_eq!(got[i], want, "entry {i}");
+    }
+}
+
+/// Every chains backend must agree with the serial chain
+///
+/// `hash_chains` only ever exercises the kernel dispatch picks, so each step
+/// kernel the CPU can run is driven through the scheduler here. Batch sizes
+/// sit below, at, and past every kernel width, and the lengths are ragged
+/// with zeros mixed in, so filling, retiring, and refilling all happen at
+/// every width.
+#[test]
+fn chains_backends_agree() {
+    use tape_sha256::{backends::chains, hash_chain};
+
+    let seeds: Vec<[u8; 32]> = (0..71u8).map(|i| [i.wrapping_mul(29); 32]).collect();
+    let lens: Vec<u64> = (0..71u64).map(|i| (i * 13) % 97).collect();
+    let want: Vec<[u8; 32]> = seeds
+        .iter()
+        .zip(&lens)
+        .map(|(s, &l)| hash_chain(s, l))
+        .collect();
+
+    macro_rules! check {
+        ($name:literal, $f:expr) => {
+            for n in [0usize, 1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 71] {
+                let mut got = vec![[0u8; 32]; n];
+                $f(&seeds[..n], &lens[..n], &mut got);
+                assert_eq!(got, want[..n], concat!($name, " n={}"), n);
+            }
+        };
+    }
+
+    check!("portable1", chains::portable1);
+    check!("portable8", chains::portable8);
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "scalar")))]
+    {
+        check!("neon4", |s, l, o: &mut [_]| unsafe {
+            chains::neon4(s, l, o)
+        });
+        if std::arch::is_aarch64_feature_detected!("sha2") {
+            check!("neon_sha2x4", |s, l, o: &mut [_]| unsafe {
+                chains::neon_sha2x4(s, l, o)
+            });
+            check!("neon_sha2x8", |s, l, o: &mut [_]| unsafe {
+                chains::neon_sha2x8(s, l, o)
+            });
+        }
+    }
+
+    // Only ever run on real x86, same as `backends_agree`: the gate the AVX
+    // chain kernels must pass before they are trusted anywhere.
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+    {
+        if is_x86_feature_detected!("sha") {
+            check!("shani_x4", |s, l, o: &mut [_]| unsafe {
+                chains::shani_x4(s, l, o)
+            });
+        }
+        if is_x86_feature_detected!("avx2") {
+            check!("avx2_8", |s, l, o: &mut [_]| unsafe {
+                chains::avx2_8(s, l, o)
+            });
+        }
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            check!("avx512_16", |s, l, o: &mut [_]| unsafe {
+                chains::avx512_16(s, l, o)
+            });
+            check!("avx512_16x2", |s, l, o: &mut [_]| unsafe {
+                chains::avx512_16x2(s, l, o)
+            });
         }
     }
 }

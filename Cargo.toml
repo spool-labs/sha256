@@ -1,13 +1,13 @@
 [package]
 name = "tape-sha256"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 license = "Apache-2.0"
-description = "Pure-Rust, SIMD-accelerated multi-buffer SHA-256 for hashing many independent messages at once"
+description = "Pure-Rust, hardware-accelerated SHA-256: multi-buffer batches and iterated hash chains"
 repository = "https://github.com/spool-labs/tape-sha256"
 readme = "README.md"
-keywords = ["sha256", "simd", "multi-buffer", "batch", "hash"]
+keywords = ["sha256", "simd", "multi-buffer", "batch", "hash-chain"]
 categories = ["algorithms", "cryptography"]
 
 autobenches = false
@@ -28,6 +28,13 @@ firedancer-bench = []
 
 # Adds the Firedancer AVX-512 row.
 firedancer-bench-avx512 = ["firedancer-bench"]
+
+# Benchmark-only: builds the `sha2` baseline with its hardware backend.
+sha2-asm-bench = ["sha2/asm"]
+
+# Benchmark-only: compiles benches/isal_shim.c against isa-l_crypto so its
+# multi-buffer SHA-256 can be measured side by side. Requires ISAL_DIR.
+isal-bench = []
 
 [profile.test]
 opt-level = 1
@@ -60,6 +67,10 @@ harness = false
 
 [[bench]]
 name = "merkle_nodes"
+harness = false
+
+[[bench]]
+name = "poh_chain"
 harness = false
 
 [[bench]]

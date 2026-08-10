@@ -13,59 +13,89 @@ built from source on the same machine with its matching profile, so each
 comparison is same-session; absolute numbers drift a few percent between
 sessions on cloud hardware, so only same-session pairs are meaningful.
 
-**AMD Zen 5 (EPYC 9B45, GCP c4d):**
+**AMD Zen 5 (family 0x1a), 2026-08-08:**
 
 ```
-sha2 (serial, current)          36.32 us/batch       1863 MB/s
-tape shani (x4 stream)          19.37 us/batch       3494 MB/s
-tape avx512 (16 lane)           14.01 us/batch       4831 MB/s
-tape avx512 (2x16 interlace)    10.17 us/batch       6654 MB/s
-firedancer avx (8 lane)         28.85 us/batch       2346 MB/s
-firedancer avx512 (16 lane)     14.78 us/batch       4578 MB/s
+sha2 (serial, current)          27.71 us/batch       2443 MB/s   (spread 0.8%)
+tape serial (1 lane)           109.77 us/batch        617 MB/s   (spread 0.3%)
+tape portable (8 lane)         255.13 us/batch        265 MB/s   (spread 0.2%)
+tape avx2 (8 lane)              29.34 us/batch       2307 MB/s   (spread 0.7%)
+tape shani (x4 stream)          14.76 us/batch       4584 MB/s   (spread 0.4%)
+tape avx512 (16 lane)           10.82 us/batch       6254 MB/s   (spread 0.5%)
+tape smt pair (2x avx512)       10.76 us/batch       6289 MB/s   (spread 1.3%)
+tape avx512 (2x16 interlace)     7.82 us/batch       8654 MB/s   (spread 3.9%)
+firedancer avx (8 lane)         24.97 us/batch       2711 MB/s   (spread 1.7%)
+firedancer avx512 (16 lane)     12.55 us/batch       5393 MB/s   (spread 0.3%)
+isa-l mb (x16 avx512)           10.92 us/batch       6195 MB/s   (spread 1.1%)
+isa-l mb (x16 avx512-ni)        10.85 us/batch       6237 MB/s   (spread 1.6%)
+isa-l mb (dispatched)           10.89 us/batch       6213 MB/s   (spread 1.8%)
 ```
 
-Best of six invocations, rustc 1.97.1. The tape rows are a fresh session;
-the Firedancer rows carry over from the previous one on this same part
-(GCC 15.3, `linux_gcc_zen5`), which the tape rows reproduce to within
-0.6%, so the pairing still holds.
+One pinned invocation, so every row above shares a run and no pairing is
+carried across sessions. Three pinned repetitions put the interlace at
+7.82, 8.30 and 8.34 us; this is the best of them and the rest of the table
+moves under 1% between reps.
+
+This is a faster part than the c4d used through 2026-07-29, where the same
+`sha2` baseline measured 1863 MB/s against 2443 here. The exact model was
+not captured in the run logs; what is certain is AMD family 0x1a, since
+that is the only family the `avx512-2x16` dispatch is enabled for and it
+is the backend the binary selected.
 
 The dispatched kernel is the `avx512-2x16` interlace: two 16-lane
 compressions with their rounds interlaced in one thread, filling the
-dependency stalls a single wave leaves idle. **3.57x over the serial
-baseline, 38% over the single wave, and ~45% faster than Firedancer** —
-though this stays the volatile row, spanning 10.17 to 11.68 across
-invocations, so read the Firedancer margin as 27-45% and the table as its
-best case. Enabled on AMD family 0x1a only: measured neutral on Zen 4,
-and on Intel it wins the cycles but loses the clock to the AVX-512
-licence. Both keep the single wave; see those sections.
+dependency stalls a single wave leaves idle. **3.54x over the serial
+baseline, 38% over the single wave, 60% faster than Firedancer's AVX-512
+kernel, and 39% faster than isa-l_crypto's best.** Enabled on AMD family
+0x1a only: measured neutral on Zen 4, and on Intel it wins the cycles but
+loses the clock to the AVX-512 licence. Both keep the single wave; see
+those sections.
+
+isa-l_crypto is the other production multi-buffer implementation worth
+measuring against, and it lands within 1% of tape's *single* 16-lane wave
+(6237 against 6254) while both of its AVX-512 entry points and its own
+dispatcher agree to within 0.7%. Its `avx512-ni` variant, which uses the
+SHA extension inside the multi-buffer manager, buys it nothing here. The
+comparison is not quite like for like in isa-l's favour or against: its
+API is a job manager rather than a kernel call, so the row includes submit
+and flush scheduling that tape's does not do, and the prefix concatenation
+is hoisted out of the timed region for both.
+
+Building with `-C target-cpu=native` makes the interlace **worse**: the
+same source measured 8.19-8.32 us on the default build and 8.88-9.47 us
+with native, an 8-14% loss, while `shani-x4` and the single AVX-512 wave
+moved under 2%. That is the instruction-cache footprint below biting
+again, and it is a reason not to recommend `target-cpu=native` for this
+crate. Native does help the two kernels dispatch never selects on this
+part -- `avx2-8` went 29.49 to 20.56 us and `portable-8` 242.43 to 147.28
+-- which is why the loss shows up only where it costs anything.
 
 Rounds 16..64 are rolled rather than fully unrolled, which is a
 measurement-integrity matter rather than a style one. Fully unrolled the
 kernel body is 30,748 bytes against Zen 5's 32 KB 8-way L1 instruction
 cache — roughly 7.5 of 8 ways per set, so whether it fits is decided by
 where the linker happens to put it. In that state this row moved between
-18.15 and 11.31 us purely from 35 KB of unrelated code elsewhere in the
-crate, with the hot loop byte-identical and the spill counts equal; the
-same source built with `-Cllvm-args=-align-all-functions=9` went from
-18.14 to 11.2. Rolling brings the body to 22,333 bytes, and the cliff
-goes away. Anything that grows this kernel should re-check that number.
+18.15 and 11.31 us on the 07-29 c4d purely from 35 KB of unrelated code
+elsewhere in the crate, with the hot loop byte-identical and the spill
+counts equal; the same source built with
+`-Cllvm-args=-align-all-functions=9` went from 18.14 to 11.2. Rolling
+brings the body to 22,333 bytes, and the cliff goes away. Anything that
+grows this kernel should re-check that number.
 
-That is 6.29 M hashes/sec for ~1 KB messages, or **107 M SHA-256 block
+That is 8.18 M hashes/sec for ~1 KB messages, or **139 M SHA-256 block
 compressions/sec** on one core (every message here pads to 17 blocks, so
 a batch is 1,088 block compressions). The block figure is the one worth
 quoting, since hashes/sec depends entirely on message length.
 
-The interlace does **not** beat a correctly pinned SMT pair: two threads
-on the siblings of one core hash the same batch in 9.53 us against the
-interlace's 10.79 in that same session — that pairing predates the roll
-above, which has since brought the interlace to 10.17, so the gap is
-narrower now but has not closed. An earlier note here claimed the
-opposite on the strength of a 14.41 us SMT figure, which is what the
-`smt pair` row reports when `taskset` confines both threads to one
-logical CPU — reproduced exactly, at 14.39 us, before the pinning was
-fixed. The interlace's value is that it captures most of the SMT gain
-without needing an idle sibling, which a loaded validator does not have;
-it is not a win over two real threads.
+The interlace still does **not** beat a correctly pinned SMT pair. The
+`smt pair` row in the table above reads 10.76 us, but that is the
+`taskset -c 2` artifact: confining both threads to one logical CPU is not
+an SMT pairing, and the row is meaningless under the pinning the rest of
+the table needs. An unpinned invocation in the same session restores it at
+**5.88 us against the interlace's 8.49**, so two real threads on the two
+siblings of one core remain 1.44x ahead. The interlace's value is that it
+captures most of that gain without needing an idle sibling, which a loaded
+validator does not have; it is not a win over two real threads.
 
 **AMD Zen 4 (EPYC 9B14, GCP c3d):**
 
@@ -336,7 +366,7 @@ kernel to route to.
 
 | hardware | best backend | vs `sha2` | vs Firedancer |
 |---|---|---|---|
-| AMD Zen 5 | `avx512-2x16` | 3.6x | **~27-45% faster** |
+| AMD Zen 5 | `avx512-2x16` | 3.5x | **60% faster** |
 | AMD Zen 4 | `shani-x4` | 2.1x | **~8% faster** |
 | AMD Zen 3 | `shani-x4` | 2.1x | **~2.2x faster** |
 | Intel EMR / GNR | `avx512-16` | 2.0-2.1x | ~1% slower (cycles) |
@@ -347,11 +377,13 @@ to this crate made recovery 14-21% faster end-to-end, and the
 single-threaded SIMD path outperformed the existing 7-thread rayon pool by
 1.55x, returning six cores to the rest of the validator.
 
-## Running the Firedancer comparison
+## Running the reference comparisons
 
-To include the Firedancer reference rows in `merkle_leaves` or
-`blob_group`, point `FD_LIB_DIR` at a Firedancer build's lib directory and
-enable the bench-only feature:
+Both reference implementations are behind bench-only features and neither
+is vendored into or linked against the library itself.
+
+To include the Firedancer rows in `merkle_leaves` or `blob_group`, point
+`FD_LIB_DIR` at a Firedancer build's lib directory and enable the feature:
 
 ```sh
 FD_LIB_DIR=/path/to/firedancer/build/linux/gcc/zen5/lib \
@@ -363,5 +395,18 @@ FD_LIB_DIR=/path/to/firedancer/build/linux/gcc/zen5/lib \
 whose machine profile enabled AVX-512. The symbol does not exist otherwise
 and the bench will fail to link rather than fall back.
 
-Nothing from Firedancer is vendored into or linked against the library
-itself.
+For the isa-l_crypto rows, point `ISAL_DIR` at an isa-l_crypto tree that
+has been built in place and enable `isal-bench`:
+
+```sh
+ISAL_DIR=/path/to/isa-l_crypto \
+  cargo bench --bench merkle_leaves --features isal-bench
+```
+
+The build accepts either a built-in-place tree (headers under `include/`,
+archive under `.libs/`) or an installed prefix. The arch-specific entry
+points it times are exported from `libisal_crypto.a` but declared only in
+`include/internal/`, so `benches/isal_shim.c` redeclares them against the
+public types; every entry point is checked against `sha2` before it is
+timed, since a mis-wired one produces a fast wrong answer rather than a
+link error.

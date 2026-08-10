@@ -67,7 +67,15 @@ pub(crate) unsafe fn transpose8(r: [__m256i; 8]) -> [__m256i; 8] {
 /// The one concrete instantiation of the flat kernel for this backend.
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn group(msgs: &[crate::batch::Message<'_>], out: &mut [[u8; 32]]) {
-    crate::batch::hash_lanes::<Avx2>(msgs, out)
+    crate::batch::hash_lanes::<Avx2, { <Avx2 as Lanes>::N }>(msgs, out)
+}
+
+/// # Safety
+///
+/// The running CPU must support AVX2.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn steps(h: &mut [[u32; 8]], n: u64) {
+    crate::chain::steps_lanes::<Avx2, { <Avx2 as Lanes>::N }>(h, n)
 }
 
 impl Lanes for Avx2 {

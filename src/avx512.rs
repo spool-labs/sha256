@@ -59,7 +59,15 @@ unsafe fn transpose_rest(t: [__m512i; 16]) -> [__m512i; 16] {
 /// The running CPU must support AVX-512F and AVX-512BW.
 #[target_feature(enable = "avx512f,avx512bw")]
 pub(crate) unsafe fn group(msgs: &[crate::batch::Message<'_>], out: &mut [[u8; 32]]) {
-    crate::batch::hash_lanes::<Avx512>(msgs, out)
+    crate::batch::hash_lanes::<Avx512, { <Avx512 as Lanes>::N }>(msgs, out)
+}
+
+/// # Safety
+///
+/// The running CPU must support AVX-512F and AVX-512BW.
+#[target_feature(enable = "avx512f,avx512bw")]
+pub(crate) unsafe fn steps(h: &mut [[u32; 8]], n: u64) {
+    crate::chain::steps_lanes::<Avx512, { <Avx512 as Lanes>::N }>(h, n)
 }
 
 impl Lanes for Avx512 {

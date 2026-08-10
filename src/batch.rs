@@ -207,7 +207,7 @@ pub(crate) fn stage_prefix_block(
 }
 
 #[inline]
-pub(crate) fn write_digest(state: &[[u32; MAX_LANES]; 8], lane: usize, out: &mut [u8; 32]) {
+pub(crate) fn write_digest<const W: usize>(state: &[[u32; W]; 8], lane: usize, out: &mut [u8; 32]) {
     for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
         chunk.copy_from_slice(&state[i][lane].to_be_bytes());
     }
@@ -217,10 +217,17 @@ pub(crate) fn write_digest(state: &[[u32; MAX_LANES]; 8], lane: usize, out: &mut
 ///
 /// Lengths may differ; a lane that finishes early has its digest taken and
 /// then idles to the end of the longest lane.
+///
+/// `W` sizes the per-call scratch and must be `L::N`; callers pass
+/// `{ <T as Lanes>::N }`. It cannot be read off `L` directly because array
+/// lengths may not depend on an associated const. Sizing it to the lane count
+/// rather than `MAX_LANES` is worth ~8% at one lane, where the fixed-size form
+/// zeroed 2.2 KB of stack per call to use a sixteenth of it.
 #[inline(always)]
-pub(crate) fn hash_lanes<L: Lanes>(msgs: &[Message<'_>], out: &mut [[u8; 32]]) {
+pub(crate) fn hash_lanes<L: Lanes, const W: usize>(msgs: &[Message<'_>], out: &mut [[u8; 32]]) {
     // A wider backend would silently overrun the staging arrays.
     const { assert!(L::N <= MAX_LANES) };
+    const { assert!(L::N == W) };
     assert!(msgs.len() <= L::N);
     assert_eq!(msgs.len(), out.len());
     let n = msgs.len();
@@ -231,7 +238,7 @@ pub(crate) fn hash_lanes<L: Lanes>(msgs: &[Message<'_>], out: &mut [[u8; 32]]) {
     let mut state = H0.map(L::splat);
 
     // Needed per lane per iteration, so derive them once up front.
-    let mut nblocks = [0usize; MAX_LANES];
+    let mut nblocks = [0usize; W];
     let mut max_blocks = 0usize;
     for (lane, m) in msgs.iter().enumerate() {
         let b = m.blocks();
@@ -240,19 +247,19 @@ pub(crate) fn hash_lanes<L: Lanes>(msgs: &[Message<'_>], out: &mut [[u8; 32]]) {
     }
     let uniform = nblocks[..n].iter().all(|&b| b == max_blocks);
 
-    let mut blocks = [[0u8; BLOCK]; MAX_LANES];
-    let mut unpacked = [[0u32; MAX_LANES]; 8];
+    let mut blocks = [[0u8; BLOCK]; W];
+    let mut unpacked = [[0u32; W]; 8];
 
     let shape = Shape::of(msgs);
-    let mut bases: [*const u8; MAX_LANES] = [std::ptr::null(); MAX_LANES];
+    let mut bases: [*const u8; W] = [std::ptr::null(); W];
     for (b, m) in bases.iter_mut().zip(msgs) {
         *b = m.body.as_ptr();
     }
-    let mut staged = [usize::MAX; MAX_LANES];
-    let mut kk = [0usize; MAX_LANES];
-    let mut interior = [false; MAX_LANES];
+    let mut staged = [usize::MAX; W];
+    let mut kk = [0usize; W];
+    let mut interior = [false; W];
 
-    let mut srcs: [*const u8; MAX_LANES] = [std::ptr::null(); MAX_LANES];
+    let mut srcs: [*const u8; W] = [std::ptr::null(); W];
     let staged0 = stage_prefix_block(msgs, &shape, &mut blocks);
     for k in 0..max_blocks {
         // Pre-filled then overwritten.
@@ -349,7 +356,9 @@ pub(crate) unsafe fn drive_pairs(
     // Staging is sized to the caller's width class so narrow backends do
     // not pay MAX_WIDTH's init: 32 slots is 1.5KB of stores per call, and
     // only the interlace reads past 16.
-    if width <= MAX_LANES {
+    if width == 1 {
+        drive_pairs_staged::<1>(width, group, prefix, left, right, out)
+    } else if width <= MAX_LANES {
         drive_pairs_staged::<MAX_LANES>(width, group, prefix, left, right, out)
     } else {
         drive_pairs_staged::<MAX_WIDTH>(width, group, prefix, left, right, out)
@@ -426,7 +435,9 @@ pub(crate) unsafe fn drive_slices(
     out: &mut [[u8; 32]],
 ) {
     // See drive_pairs for why staging is width-classed.
-    if width <= MAX_LANES {
+    if width == 1 {
+        drive_slices_staged::<1>(width, group, prefix, bodies, out)
+    } else if width <= MAX_LANES {
         drive_slices_staged::<MAX_LANES>(width, group, prefix, bodies, out)
     } else {
         drive_slices_staged::<MAX_WIDTH>(width, group, prefix, bodies, out)
