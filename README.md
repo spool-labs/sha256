@@ -4,10 +4,10 @@
 [![Documentation](https://docs.rs/tape-sha256/badge.svg)](https://docs.rs/tape-sha256)
 [![License](https://img.shields.io/crates/l/tape-sha256.svg)](LICENSE)
 
-Pure-Rust, hardware-accelerated SHA-256 for batch hashing and iterated hash
-chains.
+Pure-Rust, hardware-accelerated SHA-256 for batch hashing, iterated hash
+chains, and single messages fed in pieces.
 
-`tape-sha256` provides two kinds of hashing:
+`tape-sha256` provides three kinds of hashing:
 
 - **Batch hashing** processes many independent messages in parallel, one per
   SIMD lane. This is useful for Merkle trees, data verification, and other
@@ -15,6 +15,8 @@ chains.
 - **Hash chains** repeatedly hash a 32-byte digest, either as one serial chain
   or as many independent chains in parallel. This is useful for workloads such
   as Solana proof-of-history verification.
+- **Incremental hashing** takes one message piece by piece, for input that is
+  never in memory whole, such as an upload checked as it arrives.
 
 The crate automatically selects the best implementation available on the
 running CPU, with portable fallbacks for unsupported targets.
@@ -76,6 +78,21 @@ let mut ends = [[0u8; 32]; 2];
 
 hash_chains(&seeds, &lengths, &mut ends);
 ```
+
+## Incremental hashing
+
+Use `Sha256` when a message arrives in pieces:
+
+```rust
+use tape_sha256::Sha256;
+
+let mut hasher = Sha256::new();
+hasher.update(b"hello ");
+hasher.update(b"world");
+let digest = hasher.finish();
+```
+
+It runs on the CPU's SHA-256 unit when there is one, the same as `hash_chain`.
 
 ## Hardware acceleration
 

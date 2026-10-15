@@ -97,6 +97,11 @@
 //! [`hash_chains`] puts the premise back. Independent chains, one per
 //! verified entry, say run in lockstep exactly like independent messages
 //! do, which trades that latency floor for a throughput one. See both.
+//!
+//! # One message in pieces
+//!
+//! [`Sha256`] hashes a single message fed piece by piece, for input that is
+//! never in memory whole, on the same SHA-256 unit `hash_chain` uses.
 
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
 mod avx2;
@@ -107,6 +112,7 @@ mod avx512x2;
 mod batch;
 mod chain;
 mod core;
+mod hasher;
 mod lanes;
 #[cfg(all(target_arch = "aarch64", not(feature = "scalar")))]
 mod neon;
@@ -121,7 +127,7 @@ mod shani;
 ))]
 mod simd128;
 
-pub use batch::Message;
+pub use {batch::Message, hasher::Sha256};
 
 use {
     batch::{drive, drive_pairs, drive_slices},

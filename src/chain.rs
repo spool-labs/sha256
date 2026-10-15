@@ -421,7 +421,7 @@ pub(crate) unsafe fn run_scheduled(
 /// never more than one live message.
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kernel {
+pub(crate) enum Kernel {
     Portable,
     #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
     ShaNi,
@@ -430,7 +430,7 @@ enum Kernel {
 }
 
 impl Kernel {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Kernel::Portable => "portable",
             #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
@@ -443,7 +443,7 @@ impl Kernel {
 
 #[inline]
 #[allow(clippy::needless_return)]
-fn select() -> Kernel {
+pub(crate) fn select() -> Kernel {
     #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
     {
         if crate::dispatch::have_shani() {

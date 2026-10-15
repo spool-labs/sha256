@@ -284,6 +284,27 @@ pub(crate) unsafe fn chain(seed: &[u8; 32], n: u64) -> [u8; 32] {
     out
 }
 
+/// Folds whole 64-byte blocks into eight in-order state words
+///
+/// # Safety
+///
+/// The running CPU must support SHA-NI, SSSE3, and SSE4.1.
+#[target_feature(enable = "sha,ssse3,sse4.1")]
+pub(crate) unsafe fn compress_blocks(words: &mut [u32; 8], blocks: &[u8]) {
+    debug_assert_eq!(blocks.len() % BLOCK, 0);
+    let mut state = State::pack(
+        _mm_loadu_si128(words.as_ptr() as *const __m128i),
+        _mm_loadu_si128(words.as_ptr().add(4) as *const __m128i),
+    );
+    for block in blocks.chunks_exact(BLOCK) {
+        let mut message = load_msg(block);
+        compress_block(&mut state, &mut message);
+    }
+    let (abcd, efgh) = state.words();
+    _mm_storeu_si128(words.as_mut_ptr() as *mut __m128i, abcd);
+    _mm_storeu_si128(words.as_mut_ptr().add(4) as *mut __m128i, efgh);
+}
+
 /// Advances `STREAMS` interlaced chains `n` links: this unit's step kernel
 ///
 /// The serial chain leaves the SHA unit's issue slots mostly idle behind one
