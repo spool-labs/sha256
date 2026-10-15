@@ -296,7 +296,7 @@ pub(crate) unsafe fn compress_blocks(words: &mut [u32; 8], blocks: &[u8]) {
         _mm_loadu_si128(words.as_ptr() as *const __m128i),
         _mm_loadu_si128(words.as_ptr().add(4) as *const __m128i),
     );
-    for block in blocks.chunks_exact(BLOCK) {
+    for block in blocks.as_chunks::<BLOCK>().0 {
         let mut message = load_msg(block);
         compress_block(&mut state, &mut message);
     }

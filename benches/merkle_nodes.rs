@@ -88,7 +88,7 @@ fn main() {
 
     assert_eq!(nodes.len(), 2 * total, "need two inputs per join");
     assert_eq!(
-        nodes.chunks_exact(2).count(),
+        nodes.as_chunks::<2>().0.len(),
         total,
         "pair count must equal total"
     );
@@ -99,7 +99,7 @@ fn main() {
 
     let mut sout = vec![[0u8; 32]; total];
     let serial = bench("validator join (serial)", total, || {
-        for (o, p) in sout.iter_mut().zip(nodes.chunks_exact(2)) {
+        for (o, p) in sout.iter_mut().zip(nodes.as_chunks::<2>().0.iter()) {
             *o = join_serial(&p[0], &p[1]);
         }
         std::hint::black_box(&sout);
@@ -116,7 +116,7 @@ fn main() {
     // Row 1: everything the caller must do per batch -- concat both halves and
     // build the slice table -- then hash.
     let batched = bench("prefixed + concat (per call)", total, || {
-        for (b, p) in bodies.iter_mut().zip(nodes.chunks_exact(2)) {
+        for (b, p) in bodies.iter_mut().zip(nodes.as_chunks::<2>().0.iter()) {
             b[..PROOF_ENTRY].copy_from_slice(&p[0][..PROOF_ENTRY]);
             b[PROOF_ENTRY..].copy_from_slice(&p[1][..PROOF_ENTRY]);
         }
@@ -128,7 +128,7 @@ fn main() {
     // Row 2: the same call with concat and slice table hoisted out entirely.
     // Compared against hash_pairs this isolates the API path, since neither
     // does any per-call setup.
-    for (b, p) in bodies.iter_mut().zip(nodes.chunks_exact(2)) {
+    for (b, p) in bodies.iter_mut().zip(nodes.as_chunks::<2>().0.iter()) {
         b[..PROOF_ENTRY].copy_from_slice(&p[0][..PROOF_ENTRY]);
         b[PROOF_ENTRY..].copy_from_slice(&p[1][..PROOF_ENTRY]);
     }
@@ -140,7 +140,7 @@ fn main() {
 
     // Correctness: the batched path must equal the serial join.
     {
-        let pairs: Vec<_> = nodes.chunks_exact(2).take(total).collect();
+        let pairs: Vec<_> = nodes.as_chunks::<2>().0.iter().take(total).collect();
         let bodies: Vec<[u8; 2 * PROOF_ENTRY]> = pairs
             .iter()
             .map(|p| {
@@ -169,7 +169,7 @@ fn main() {
             let base = set * joins_per_set * 2;
             for (b, p) in sbodies
                 .iter_mut()
-                .zip(nodes[base..].chunks_exact(2).take(joins_per_set))
+                .zip(nodes[base..].as_chunks::<2>().0.iter().take(joins_per_set))
             {
                 b[..PROOF_ENTRY].copy_from_slice(&p[0][..PROOF_ENTRY]);
                 b[PROOF_ENTRY..].copy_from_slice(&p[1][..PROOF_ENTRY]);
@@ -183,11 +183,15 @@ fn main() {
     // The point of hash_pairs: the two 20-byte halves are read in place, so
     // there is no concat and no bodies buffer at all.
     let lefts: Vec<&[u8]> = nodes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| &p[0][..PROOF_ENTRY])
         .collect();
     let rights: Vec<&[u8]> = nodes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| &p[1][..PROOF_ENTRY])
         .collect();
     let mut pout = vec![[0u8; 32]; total];
@@ -195,7 +199,7 @@ fn main() {
         hash_pairs(PREFIX_NODE, &lefts, &rights, &mut pout);
         std::hint::black_box(&pout);
     });
-    for (i, p) in nodes.chunks_exact(2).enumerate() {
+    for (i, p) in nodes.as_chunks::<2>().0.iter().enumerate() {
         assert_eq!(pout[i], join_serial(&p[0], &p[1]), "hash_pairs node {i}");
     }
 
@@ -219,7 +223,7 @@ fn main() {
                         let mut b2 = vec![[0u8; 2 * PROOF_ENTRY]; n];
                         let mut o2 = vec![[0u8; 32]; n];
                         for _ in 0..ITERS {
-                            for (b, p) in b2.iter_mut().zip(nodes[lo..].chunks_exact(2)) {
+                            for (b, p) in b2.iter_mut().zip(nodes[lo..].as_chunks::<2>().0.iter()) {
                                 b[..PROOF_ENTRY].copy_from_slice(&p[0][..PROOF_ENTRY]);
                                 b[PROOF_ENTRY..].copy_from_slice(&p[1][..PROOF_ENTRY]);
                             }

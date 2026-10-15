@@ -258,7 +258,7 @@ pub(crate) unsafe fn compress_blocks(words: &mut [u32; 8], blocks: &[u8]) {
         abcd: vld1q_u32(words.as_ptr()),
         efgh: vld1q_u32(words.as_ptr().add(4)),
     };
-    for block in blocks.chunks_exact(BLOCK) {
+    for block in blocks.as_chunks::<BLOCK>().0 {
         let mut message = load_msg(block);
         compress_block(&mut state, &mut message);
     }

@@ -23,8 +23,8 @@ pub(crate) type StepsFn = unsafe fn(&mut [[u32; 8]], u64);
 #[inline(always)]
 fn seed_words(seed: &[u8; 32]) -> [u32; 8] {
     let mut h = [0u32; 8];
-    for (hj, c) in h.iter_mut().zip(seed.chunks_exact(4)) {
-        *hj = u32::from_be_bytes(c.try_into().unwrap());
+    for (hj, c) in h.iter_mut().zip(seed.as_chunks::<4>().0) {
+        *hj = u32::from_be_bytes(*c);
     }
     h
 }
@@ -33,8 +33,8 @@ fn seed_words(seed: &[u8; 32]) -> [u32; 8] {
 #[inline(always)]
 fn word_bytes(h: &[u32; 8]) -> [u8; 32] {
     let mut out = [0u8; 32];
-    for (c, hj) in out.chunks_exact_mut(4).zip(h) {
-        c.copy_from_slice(&hj.to_be_bytes());
+    for (c, hj) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
+        *c = hj.to_be_bytes();
     }
     out
 }

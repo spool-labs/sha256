@@ -208,8 +208,8 @@ pub(crate) fn stage_prefix_block(
 
 #[inline]
 pub(crate) fn write_digest<const W: usize>(state: &[[u32; W]; 8], lane: usize, out: &mut [u8; 32]) {
-    for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
-        chunk.copy_from_slice(&state[i][lane].to_be_bytes());
+    for (i, chunk) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        *chunk = state[i][lane].to_be_bytes();
     }
 }
 

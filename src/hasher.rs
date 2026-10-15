@@ -50,7 +50,8 @@ impl Sha256 {
 
         if self.pending_len > 0 {
             let taken = (BLOCK - self.pending_len).min(rest.len());
-            self.pending[self.pending_len..self.pending_len + taken].copy_from_slice(&rest[..taken]);
+            self.pending[self.pending_len..self.pending_len + taken]
+                .copy_from_slice(&rest[..taken]);
             self.pending_len += taken;
             rest = &rest[taken..];
             if self.pending_len < BLOCK {
@@ -83,8 +84,8 @@ impl Sha256 {
         compress_blocks(self.kernel, &mut self.state, &padded[..padded_len]);
 
         let mut digest = [0u8; 32];
-        for (bytes, word) in digest.chunks_exact_mut(4).zip(self.state) {
-            bytes.copy_from_slice(&word.to_be_bytes());
+        for (bytes, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
+            *bytes = word.to_be_bytes();
         }
         digest
     }
@@ -114,10 +115,10 @@ fn compress_blocks(kernel: Kernel, state: &mut [u32; 8], blocks: &[u8]) {
 
 fn compress_portable(state: &mut [u32; 8], blocks: &[u8]) {
     let mut lanes = state.map(Scalar::<1>::splat);
-    for block in blocks.chunks_exact(BLOCK) {
+    for block in blocks.as_chunks::<BLOCK>().0 {
         let mut words = [Scalar::<1>::splat(0); 16];
-        for (word, bytes) in words.iter_mut().zip(block.chunks_exact(4)) {
-            *word = Scalar::<1>::splat(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        for (word, bytes) in words.iter_mut().zip(block.as_chunks::<4>().0) {
+            *word = Scalar::<1>::splat(u32::from_be_bytes(*bytes));
         }
         compress(&mut lanes, words);
     }
@@ -143,7 +144,9 @@ mod tests {
     }
 
     fn message(len: usize) -> Vec<u8> {
-        (0..len).map(|index| (index as u8).wrapping_mul(31).wrapping_add(7)).collect()
+        (0..len)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect()
     }
 
     // every length across the padding and block edges matches, fed whole
@@ -156,7 +159,12 @@ mod tests {
 
                 hasher.update(&data);
 
-                assert_eq!(hasher.finish(), reference(&data), "{} len {len}", kernel.name());
+                assert_eq!(
+                    hasher.finish(),
+                    reference(&data),
+                    "{} len {len}",
+                    kernel.name()
+                );
             }
         }
     }
@@ -204,7 +212,11 @@ mod tests {
         }
 
         let expected = "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
-        let digest: String = hasher.finish().iter().map(|byte| format!("{byte:02x}")).collect();
+        let digest: String = hasher
+            .finish()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         assert_eq!(digest, expected);
     }
 }
