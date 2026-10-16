@@ -113,7 +113,9 @@ fn main() {
     // LEFT || left || RIGHT || right, 73 bytes.
     let children: Vec<[u8; 32]> = (0..2 * JOINS).map(|i| [i as u8; 32]).collect();
     let joined: Vec<Vec<u8>> = children
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| [LEFT_LABEL, &p[0], RIGHT_LABEL, &p[1]].concat())
         .collect();
     let joined_refs: Vec<&[u8]> = joined.iter().map(|j| j.as_slice()).collect();

@@ -246,6 +246,26 @@ pub(crate) unsafe fn chain(seed: &[u8; 32], n: u64) -> [u8; 32] {
     out
 }
 
+/// Folds whole 64-byte blocks into eight in-order state words
+///
+/// # Safety
+///
+/// The running CPU must support the ARMv8 SHA-256 extension (`sha2`).
+#[target_feature(enable = "sha2")]
+pub(crate) unsafe fn compress_blocks(words: &mut [u32; 8], blocks: &[u8]) {
+    debug_assert_eq!(blocks.len() % BLOCK, 0);
+    let mut state = State {
+        abcd: vld1q_u32(words.as_ptr()),
+        efgh: vld1q_u32(words.as_ptr().add(4)),
+    };
+    for block in blocks.as_chunks::<BLOCK>().0 {
+        let mut message = load_msg(block);
+        compress_block(&mut state, &mut message);
+    }
+    vst1q_u32(words.as_mut_ptr(), state.abcd);
+    vst1q_u32(words.as_mut_ptr().add(4), state.efgh);
+}
+
 /// Advances `S` interlaced chains `n` links: this unit's step kernel
 ///
 /// The serial chain leaves the SHA unit's issue slots mostly idle behind one
