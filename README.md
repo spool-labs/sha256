@@ -53,6 +53,22 @@ let mut digests = vec![[0u8; 32]; leaves.len()];
 hash_many_prefixed(b"LEAF", &leaves, &mut digests);
 ```
 
+To filter on the leading bits of `prefix || body` (a proof-of-work or prefix
+search over one-block messages), `hash_short_heads` returns only the first
+32-bit digest word of each message. When the backend is AVX2 and every message
+fits one block, it skips digest serialisation; otherwise it is
+`hash_many_prefixed` truncated, so the words are the same on every backend.
+The word is a filter: verify matches against the full digest.
+
+```rust
+use tape_sha256::hash_short_heads;
+
+let bodies: Vec<&[u8]> = vec![b"1", b"2", b"3"];
+let mut heads = vec![0u32; bodies.len()];
+
+hash_short_heads(b"nonce:", &bodies, &mut heads);
+```
+
 For Merkle-tree parent nodes, `hash_pairs` similarly hashes
 `prefix || left || right` without constructing temporary buffers.
 

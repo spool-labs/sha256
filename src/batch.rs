@@ -18,6 +18,10 @@ pub(crate) const MAX_WIDTH: usize = 32;
 
 pub(crate) const BLOCK: usize = 64;
 
+/// Longest message that fits one block with its 0x80 byte and 8-byte length
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+pub(crate) const ONE_BLOCK_MAX: usize = BLOCK - 9;
+
 /// One message to hash: an optional shared prefix plus a body
 ///
 /// Keeping the prefix separate lets the Merkle-leaf case skip materialising
@@ -464,4 +468,51 @@ unsafe fn drive_slices_staged<const W: usize>(
         }
         group(&staging[..chunk.len()], o);
     }
+}
+
+/// Hashes one-block messages `prefix || body` and keeps only digest word 0
+///
+/// Stages one padded block per lane and skips the byte-wise digest output.
+/// Each `prefix || body` must be at most `ONE_BLOCK_MAX` bytes.
+///
+/// # Panics
+///
+/// Panics if there are more bodies than lanes, if `out.len() != bodies.len()`,
+/// or if any `prefix || body` exceeds `ONE_BLOCK_MAX`.
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+#[inline(always)]
+pub(crate) fn heads_lanes<L: Lanes, const W: usize>(
+    prefix: &[u8],
+    bodies: &[&[u8]],
+    out: &mut [u32],
+) {
+    // See hash_lanes for why W is a separate parameter.
+    const { assert!(L::N == W) };
+    let n = bodies.len();
+    assert!(n <= L::N);
+    assert_eq!(n, out.len());
+    if n == 0 {
+        return;
+    }
+    let mut blocks = [[0u8; BLOCK]; W];
+    let mut srcs: [*const u8; W] = [std::ptr::null(); W];
+    let p = prefix.len();
+    for (i, body) in bodies.iter().enumerate() {
+        let len = p + body.len();
+        assert!(len <= ONE_BLOCK_MAX, "message must fit one block");
+        let blk = &mut blocks[i];
+        blk[..p].copy_from_slice(prefix);
+        blk[p..len].copy_from_slice(body);
+        blk[len] = 0x80;
+        blk[BLOCK - 8..].copy_from_slice(&((len as u64) * 8).to_be_bytes());
+        srcs[i] = blk.as_ptr();
+    }
+    // SAFETY: the first n lanes point at full 64-byte blocks that outlive the
+    // call, and `n` is at least 1 and at most `L::N`.
+    let w = unsafe { L::transpose(&srcs, n) };
+    let mut state = H0.map(L::splat);
+    compress::<L>(&mut state, w);
+    let mut head = [0u32; W];
+    state[0].store(&mut head);
+    out.copy_from_slice(&head[..n]);
 }

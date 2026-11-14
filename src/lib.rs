@@ -28,6 +28,10 @@
 //! hash_many_prefixed(LEAF, &leaves, &mut out);
 //! ```
 //!
+//! For searches that only compare the leading bits of each digest, such as a
+//! proof-of-work nonce search, `hash_short_heads` returns just the first
+//! 32-bit word of each digest.
+//!
 //! # Correctness
 //!
 //! Output is bit-identical to any conforming SHA-256. Every backend is gated
@@ -166,6 +170,39 @@ pub fn hash_many(msgs: &[&[u8]], out: &mut [[u8; 32]]) {
 /// Panics if `bodies.len() != out.len()`.
 pub fn hash_many_prefixed(prefix: &[u8], bodies: &[&[u8]], out: &mut [[u8; 32]]) {
     dispatch::hash_slices(prefix, bodies, out);
+}
+
+/// First 32 bits of `SHA-256(prefix || body)` for each body, big-endian
+///
+/// Equals the first four bytes of the digest `hash_many_prefixed` gives, as a
+/// `u32`. For callers that filter on the leading bits of a digest, such as a
+/// proof-of-work search or a prefix match, and verify the survivors in full.
+/// Where the active backend is AVX2 and every `prefix || body` fits one block
+/// (at most 55 bytes), this skips digest serialisation. Every other case, any
+/// other backend or any longer message, goes through `hash_many_prefixed`, so
+/// the words are the same everywhere.
+///
+/// The head word is a filter, not a hash: 32 bits collide, so a match only
+/// means "worth checking". Callers must verify survivors against the full
+/// digest (for example with `hash_many_prefixed`) before trusting them.
+///
+/// # Panics
+///
+/// Panics if `bodies.len() != out.len()`.
+///
+/// ```
+/// use tape_sha256::{hash_many_prefixed, hash_short_heads};
+///
+/// let bodies: [&[u8]; 2] = [b"1", b"22"];
+/// let mut heads = [0u32; 2];
+/// hash_short_heads(b"nonce:", &bodies, &mut heads);
+///
+/// let mut full = [[0u8; 32]; 2];
+/// hash_many_prefixed(b"nonce:", &bodies, &mut full);
+/// assert_eq!(heads[0], u32::from_be_bytes(full[0][..4].try_into().unwrap()));
+/// ```
+pub fn hash_short_heads(prefix: &[u8], bodies: &[&[u8]], out: &mut [u32]) {
+    dispatch::hash_short_heads(prefix, bodies, out);
 }
 
 /// Hashes `prefix || left || right` for each pair, without joining them first
@@ -422,6 +459,23 @@ pub mod backends {
     #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
     pub unsafe fn avx2_8_slices(prefix: &[u8], bodies: &[&[u8]], out: &mut [[u8; 32]]) {
         drive_slices(8, crate::avx2::group, prefix, bodies, out)
+    }
+
+    /// First-digest-word AVX2 kernel behind `hash_short_heads`
+    ///
+    /// Handles up to 8 bodies per call, each `prefix || body` at most 55 bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are more than 8 bodies, if `out.len() != bodies.len()`,
+    /// or if any `prefix || body` exceeds 55 bytes.
+    ///
+    /// # Safety
+    ///
+    /// The running CPU must support AVX2.
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+    pub unsafe fn avx2_8_heads(prefix: &[u8], bodies: &[&[u8]], out: &mut [u32]) {
+        crate::avx2::heads(prefix, bodies, out)
     }
 
     /// 16-lane AVX-512 kernel
@@ -908,6 +962,35 @@ mod dispatch {
                 not(feature = "scalar")
             ))]
             Kernel::Simd128_4 => backends::simd128_4_slices(prefix, bodies, out),
+        }
+    }
+
+    pub(crate) fn hash_short_heads(prefix: &[u8], bodies: &[&[u8]], out: &mut [u32]) {
+        assert_eq!(
+            bodies.len(),
+            out.len(),
+            "output slice must have one word per message"
+        );
+        // Only the AVX2 kernel has a heads variant; where dispatch picks SHA-NI
+        // or AVX-512 those kernels are faster, so they take the general path.
+        #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+        if select() == Kernel::Avx2_8
+            && bodies
+                .iter()
+                .all(|b| prefix.len() + b.len() <= batch::ONE_BLOCK_MAX)
+        {
+            for (b, o) in bodies.chunks(8).zip(out.chunks_mut(8)) {
+                // SAFETY: select() returned Avx2_8, so AVX2 is available.
+                unsafe { backends::avx2_8_heads(prefix, b, o) };
+            }
+            return;
+        }
+        let mut full = [[0u8; 32]; 64];
+        for (b, o) in bodies.chunks(64).zip(out.chunks_mut(64)) {
+            hash_slices(prefix, b, &mut full[..b.len()]);
+            for (d, w) in full.iter().zip(o.iter_mut()) {
+                *w = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+            }
         }
     }
 
