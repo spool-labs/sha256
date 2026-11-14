@@ -53,6 +53,18 @@ let mut digests = vec![[0u8; 32]; leaves.len()];
 hash_many_prefixed(b"LEAF", &leaves, &mut digests);
 ```
 
+When only the leading bits of each digest matter, as in a proof-of-work
+search, `hash_short_heads` returns the first 32-bit word of each:
+
+```rust
+use tape_sha256::hash_short_heads;
+
+let bodies: Vec<&[u8]> = vec![b"1", b"2", b"3"];
+let mut heads = vec![0u32; bodies.len()];
+
+hash_short_heads(b"nonce:", &bodies, &mut heads);
+```
+
 For Merkle-tree parent nodes, `hash_pairs` similarly hashes
 `prefix || left || right` without constructing temporary buffers.
 

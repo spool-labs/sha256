@@ -74,6 +74,10 @@ name = "poh_chain"
 harness = false
 
 [[bench]]
+name = "short_heads"
+harness = false
+
+[[bench]]
 name = "shred_verify"
 harness = false
 

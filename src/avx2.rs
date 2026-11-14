@@ -179,3 +179,13 @@ impl Lanes for Avx2 {
         }
     }
 }
+
+/// First digest word of each one-block message, for up to 8 bodies
+///
+/// # Safety
+///
+/// The running CPU must support AVX2.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn heads(prefix: &[u8], bodies: &[&[u8]], out: &mut [u32]) {
+    crate::batch::heads_lanes::<Avx2, { <Avx2 as Lanes>::N }>(prefix, bodies, out)
+}

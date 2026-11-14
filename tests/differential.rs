@@ -611,3 +611,70 @@ fn chains_backends_agree() {
         }
     }
 }
+
+/// First digest word of `prefix || body`, from the independent reference
+fn reference_head(prefix: &[u8], body: &[u8]) -> u32 {
+    let d = reference(&[prefix, body].concat());
+    u32::from_be_bytes([d[0], d[1], d[2], d[3]])
+}
+
+/// `hash_short_heads` must give the first four digest bytes at every length
+/// either side of the one-block limit, at several prefix splits, in partial
+/// batches, and in batches where one message is a byte longer than the rest
+#[test]
+fn short_heads_match_digest() {
+    use tape_sha256::hash_short_heads;
+
+    for total in 0..=130usize {
+        for split in [0, total / 2, total] {
+            let prefix = pattern(split, 7);
+            for count in [0usize, 1, 7, 8, 9, 17, 70] {
+                for longer in [None, Some(count / 2)] {
+                    let bodies: Vec<Vec<u8>> = (0..count)
+                        .map(|i| {
+                            let extra = usize::from(longer == Some(i));
+                            pattern(total - split + extra, i as u8)
+                        })
+                        .collect();
+                    let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
+                    let mut got = vec![0u32; count];
+                    hash_short_heads(&prefix, &refs, &mut got);
+                    for (i, b) in bodies.iter().enumerate() {
+                        assert_eq!(
+                            got[i],
+                            reference_head(&prefix, b),
+                            "total {total} split {split} count {count} longer {longer:?} lane {i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The AVX2 heads kernel, called directly so hosts whose dispatch prefers
+/// SHA-NI or AVX-512 still run it: every one-block length and lane count, at
+/// three prefix splits, with lengths ragged across the lanes
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
+#[test]
+fn short_heads_avx2_kernel() {
+    if !is_x86_feature_detected!("avx2") {
+        return;
+    }
+    for total in 0..=55usize {
+        for split in [0, total / 2, total] {
+            let prefix = pattern(split, 3);
+            for count in 1..=8usize {
+                // Lane i is i bytes shorter, down to an empty body.
+                let bodies: Vec<Vec<u8>> = (0..count)
+                    .map(|i| pattern((total - split).saturating_sub(i), i as u8))
+                    .collect();
+                let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
+                let want: Vec<u32> = bodies.iter().map(|b| reference_head(&prefix, b)).collect();
+                let mut got = vec![0u32; count];
+                unsafe { tape_sha256::backends::avx2_8_heads(&prefix, &refs, &mut got) };
+                assert_eq!(got, want, "total {total} split {split} count {count}");
+            }
+        }
+    }
+}
