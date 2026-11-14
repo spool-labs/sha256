@@ -653,8 +653,8 @@ fn short_heads_match_digest() {
 }
 
 /// The AVX2 heads kernel, called directly so hosts whose dispatch prefers
-/// SHA-NI or AVX-512 still run it: every one-block length, prefix split and
-/// lane count, with lengths ragged across the lanes
+/// SHA-NI or AVX-512 still run it: every one-block length and lane count, at
+/// three prefix splits, with lengths ragged across the lanes
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
 #[test]
 fn short_heads_avx2_kernel() {
