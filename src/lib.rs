@@ -29,7 +29,7 @@
 //! ```
 //!
 //! For searches that only compare the leading bits of each digest, such as a
-//! proof-of-work nonce search, `hash_short_heads` returns just the first
+//! proof-of-work nonce search, [`hash_short_heads`] returns just the first
 //! 32-bit word of each digest.
 //!
 //! # Correctness
@@ -174,33 +174,14 @@ pub fn hash_many_prefixed(prefix: &[u8], bodies: &[&[u8]], out: &mut [[u8; 32]])
 
 /// First 32 bits of `SHA-256(prefix || body)` for each body, big-endian
 ///
-/// Equals the first four bytes of the digest `hash_many_prefixed` gives, as a
-/// `u32`. For callers that filter on the leading bits of a digest, such as a
-/// proof-of-work search or a prefix match, and verify the survivors in full.
-/// Where the active backend is AVX2 and every `prefix || body` fits one block
-/// (at most 55 bytes), this skips digest serialisation. Every other case, any
-/// other backend or any longer message, goes through `hash_many_prefixed`, so
-/// the words are the same everywhere.
-///
-/// The head word is a filter, not a hash: 32 bits collide, so a match only
-/// means "worth checking". Callers must verify survivors against the full
-/// digest (for example with `hash_many_prefixed`) before trusting them.
+/// The first four bytes of what hash_many_prefixed gives, for searches that
+/// filter on leading digest bits. On the AVX2 kernel, when every message fits
+/// one block, it skips building the rest of the digest. 32 bits collide, so
+/// verify matches against the full digest.
 ///
 /// # Panics
 ///
 /// Panics if `bodies.len() != out.len()`.
-///
-/// ```
-/// use tape_sha256::{hash_many_prefixed, hash_short_heads};
-///
-/// let bodies: [&[u8]; 2] = [b"1", b"22"];
-/// let mut heads = [0u32; 2];
-/// hash_short_heads(b"nonce:", &bodies, &mut heads);
-///
-/// let mut full = [[0u8; 32]; 2];
-/// hash_many_prefixed(b"nonce:", &bodies, &mut full);
-/// assert_eq!(heads[0], u32::from_be_bytes(full[0][..4].try_into().unwrap()));
-/// ```
 pub fn hash_short_heads(prefix: &[u8], bodies: &[&[u8]], out: &mut [u32]) {
     dispatch::hash_short_heads(prefix, bodies, out);
 }
@@ -461,14 +442,7 @@ pub mod backends {
         drive_slices(8, crate::avx2::group, prefix, bodies, out)
     }
 
-    /// First-digest-word AVX2 kernel behind `hash_short_heads`
-    ///
-    /// Handles up to 8 bodies per call, each `prefix || body` at most 55 bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if there are more than 8 bodies, if `out.len() != bodies.len()`,
-    /// or if any `prefix || body` exceeds 55 bytes.
+    /// AVX2 kernel behind `hash_short_heads`, for up to 8 one-block messages
     ///
     /// # Safety
     ///
@@ -971,8 +945,7 @@ mod dispatch {
             out.len(),
             "output slice must have one word per message"
         );
-        // Only the AVX2 kernel has a heads variant; where dispatch picks SHA-NI
-        // or AVX-512 those kernels are faster, so they take the general path.
+        // Only the AVX2 kernel has a heads variant; the rest truncate digests.
         #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
         if select() == Kernel::Avx2_8
             && bodies

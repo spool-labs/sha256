@@ -53,12 +53,8 @@ let mut digests = vec![[0u8; 32]; leaves.len()];
 hash_many_prefixed(b"LEAF", &leaves, &mut digests);
 ```
 
-To filter on the leading bits of `prefix || body` (a proof-of-work or prefix
-search over one-block messages), `hash_short_heads` returns only the first
-32-bit digest word of each message. When the backend is AVX2 and every message
-fits one block, it skips digest serialisation; otherwise it is
-`hash_many_prefixed` truncated, so the words are the same on every backend.
-The word is a filter: verify matches against the full digest.
+When only the leading bits of each digest matter, as in a proof-of-work
+search, `hash_short_heads` returns the first 32-bit word of each:
 
 ```rust
 use tape_sha256::hash_short_heads;

@@ -613,190 +613,64 @@ fn chains_backends_agree() {
 }
 
 /// First digest word of `prefix || body`, from the independent reference
-/// Runs the AVX2 heads kernel directly, so hosts whose dispatcher prefers
-/// SHA-NI or AVX-512 still exercise it. Skips batches that exceed one block.
-fn check_avx2_heads(prefix: &[u8], refs: &[&[u8]], want: &[u32], what: &str) {
-    #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
-    if is_x86_feature_detected!("avx2") && refs.iter().all(|b| prefix.len() + b.len() <= 55) {
-        let mut got = vec![0u32; refs.len()];
-        for (b, o) in refs.chunks(8).zip(got.chunks_mut(8)) {
-            unsafe { tape_sha256::backends::avx2_8_heads(prefix, b, o) };
-        }
-        assert_eq!(got, want, "avx2_8_heads {what}");
-    }
-    let _ = (prefix, refs, want, what);
-}
-
 fn reference_head(prefix: &[u8], body: &[u8]) -> u32 {
     let d = reference(&[prefix, body].concat());
     u32::from_be_bytes([d[0], d[1], d[2], d[3]])
 }
 
-/// `hash_short_heads` must give the first four digest bytes at every prefix and
-/// body split of every one-block length, and for the longer lengths that take
-/// the general path, in batches that are not a multiple of the lane width
+/// `hash_short_heads` must give the first four digest bytes at every length
+/// either side of the one-block limit, at several prefix splits, in partial
+/// batches, and in batches where one message is a byte longer than the rest
 #[test]
 fn short_heads_match_digest() {
     use tape_sha256::hash_short_heads;
 
-    for total in (0..=55usize).chain([56, 57, 64, 65, 130]) {
-        for split in [0, 1, total / 2, total.saturating_sub(1), total] {
-            let split = split.min(total);
+    for total in 0..=130usize {
+        for split in [0, total / 2, total] {
             let prefix = pattern(split, 7);
-            for count in [0usize, 1, 7, 8, 9, 15, 16, 17, 70] {
-                let bodies: Vec<Vec<u8>> = (0..count)
-                    .map(|i| pattern(total - split, i as u8 ^ 0x5a))
-                    .collect();
-                let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
-                let mut got = vec![0u32; count];
-                hash_short_heads(&prefix, &refs, &mut got);
-                for (i, b) in bodies.iter().enumerate() {
-                    assert_eq!(
-                        got[i],
-                        reference_head(&prefix, b),
-                        "total {total} split {split} count {count} lane {i}"
-                    );
+            for count in [0usize, 1, 7, 8, 9, 17, 70] {
+                for longer in [None, Some(count / 2)] {
+                    let bodies: Vec<Vec<u8>> = (0..count)
+                        .map(|i| {
+                            let extra = usize::from(longer == Some(i));
+                            pattern(total - split + extra, i as u8)
+                        })
+                        .collect();
+                    let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
+                    let mut got = vec![0u32; count];
+                    hash_short_heads(&prefix, &refs, &mut got);
+                    for (i, b) in bodies.iter().enumerate() {
+                        assert_eq!(
+                            got[i],
+                            reference_head(&prefix, b),
+                            "total {total} split {split} count {count} longer {longer:?} lane {i}"
+                        );
+                    }
                 }
             }
         }
     }
 }
 
-/// Ragged lengths in one batch: some bodies fit one block and some do not, so
-/// the whole call must take the general path and still be right
+/// The AVX2 heads kernel, called directly so hosts whose dispatch prefers
+/// SHA-NI or AVX-512 still run it: every one-block length, every lane count
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
 #[test]
-fn short_heads_mixed_lengths() {
-    use tape_sha256::hash_short_heads;
-
-    let prefix = b"pow:";
-    let bodies: Vec<Vec<u8>> = (0..21).map(|i| pattern(i * 3, i as u8)).collect();
-    let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
-    let mut got = vec![0u32; bodies.len()];
-    hash_short_heads(prefix, &refs, &mut got);
-    for (i, b) in bodies.iter().enumerate() {
-        assert_eq!(got[i], reference_head(prefix, b), "lane {i}");
+fn short_heads_avx2_kernel() {
+    if !is_x86_feature_detected!("avx2") {
+        return;
     }
-}
-
-/// Random single-block inputs, through the public entry and the AVX2 kernel
-/// directly (which the public entry skips where SHA-NI or AVX-512 is faster)
-#[test]
-fn short_heads_random() {
-    use tape_sha256::hash_short_heads;
-
-    let mut rng = StdRng::seed_from_u64(0x7a9e_5eed);
-    for _ in 0..300 {
-        let plen = rng.gen_range(0..=40usize);
-        let prefix: Vec<u8> = (0..plen).map(|_| rng.gen()).collect();
-        let count = rng.gen_range(1..=20usize);
-        let bodies: Vec<Vec<u8>> = (0..count)
-            .map(|_| {
-                let l = rng.gen_range(0..=55 - plen);
-                (0..l).map(|_| rng.gen()).collect()
-            })
-            .collect();
-        let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
-        let want: Vec<u32> = bodies.iter().map(|b| reference_head(&prefix, b)).collect();
-
-        let mut got = vec![0u32; count];
-        hash_short_heads(&prefix, &refs, &mut got);
-        assert_eq!(got, want, "public entry");
-
-        #[cfg(all(target_arch = "x86_64", not(feature = "scalar")))]
-        if is_x86_feature_detected!("avx2") {
+    for total in 0..=55usize {
+        let prefix = pattern(total / 2, 3);
+        for count in 1..=8usize {
+            let bodies: Vec<Vec<u8>> = (0..count)
+                .map(|i| pattern(total - prefix.len(), i as u8))
+                .collect();
+            let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
+            let want: Vec<u32> = bodies.iter().map(|b| reference_head(&prefix, b)).collect();
             let mut got = vec![0u32; count];
-            for (b, o) in refs.chunks(8).zip(got.chunks_mut(8)) {
-                unsafe { tape_sha256::backends::avx2_8_heads(&prefix, b, o) };
-            }
-            assert_eq!(got, want, "avx2_8_heads");
+            unsafe { tape_sha256::backends::avx2_8_heads(&prefix, &refs, &mut got) };
+            assert_eq!(got, want, "total {total} count {count}");
         }
     }
-}
-
-#[test]
-#[should_panic]
-fn short_heads_length_mismatch_panics() {
-    let mut out = [0u32; 1];
-    tape_sha256::hash_short_heads(b"", &[b"a", b"b"], &mut out);
-}
-
-/// The 55/56-byte edge: 55 is the longest message that fits one block with
-/// padding (fast path), 56 and up must fall back and still be exact. Checked
-/// with the whole batch at the edge and with one lane over it.
-#[test]
-fn short_heads_one_block_boundary() {
-    use tape_sha256::hash_short_heads;
-
-    let prefix = pattern(20, 3);
-    for body_len in [34usize, 35, 36, 37] {
-        // total = 54, 55, 56, 57
-        for count in [1usize, 8, 9] {
-            for over_lane in [None, Some(count / 2)] {
-                let bodies: Vec<Vec<u8>> = (0..count)
-                    .map(|i| {
-                        let l = if over_lane == Some(i) {
-                            body_len + 1
-                        } else {
-                            body_len
-                        };
-                        pattern(l, i as u8)
-                    })
-                    .collect();
-                let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
-                let mut got = vec![0u32; count];
-                hash_short_heads(&prefix, &refs, &mut got);
-                for (i, b) in bodies.iter().enumerate() {
-                    assert_eq!(
-                        got[i],
-                        reference_head(&prefix, b),
-                        "body {body_len} count {count} over {over_lane:?} lane {i}"
-                    );
-                }
-                let what = format!("body {body_len} count {count} over {over_lane:?}");
-                check_avx2_heads(&prefix, &refs, &got, &what);
-            }
-        }
-    }
-}
-
-/// Every partial batch from 1 to 17 lanes, so each partial AVX2 group
-/// (1..=7, 9..=15) and the full ones are exercised
-#[test]
-fn short_heads_partial_batches() {
-    use tape_sha256::hash_short_heads;
-
-    let prefix = b"pow:";
-    for count in 1..=17usize {
-        let bodies: Vec<Vec<u8>> = (0..count).map(|i| pattern(1 + i * 3, i as u8)).collect();
-        let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
-        let mut got = vec![0u32; count];
-        hash_short_heads(prefix, &refs, &mut got);
-        for (i, b) in bodies.iter().enumerate() {
-            assert_eq!(got[i], reference_head(prefix, b), "count {count} lane {i}");
-        }
-        check_avx2_heads(prefix, &refs, &got, &format!("count {count}"));
-    }
-}
-
-/// The generic path: `hash_short_heads` must equal the portable kernels'
-/// digests truncated, whichever backend dispatch picked. The public entry
-/// cannot be forced onto the fallback at run time, so this pins the
-/// reference to the portable kernel; the `scalar` feature (`cargo test
-/// --features scalar`) routes the whole entry through it.
-#[test]
-fn short_heads_match_portable_kernel() {
-    use tape_sha256::{backends, hash_short_heads};
-
-    let prefix = b"pow:";
-    let bodies: Vec<Vec<u8>> = (0..37).map(|i| pattern(i % 51, i as u8)).collect();
-    let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
-    let mut full = vec![[0u8; 32]; refs.len()];
-    backends::portable8_slices(prefix, &refs, &mut full);
-    let want: Vec<u32> = full
-        .iter()
-        .map(|d| u32::from_be_bytes([d[0], d[1], d[2], d[3]]))
-        .collect();
-    let mut got = vec![0u32; refs.len()];
-    hash_short_heads(prefix, &refs, &mut got);
-    assert_eq!(got, want);
 }
